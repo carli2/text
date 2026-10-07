@@ -1,10 +1,11 @@
-// Copyright 2012 The Go Authors. All rights reserved.
+// Copyright 2012-2026 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package colltab
 
 import (
+	"sync"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
@@ -104,17 +105,25 @@ func (t *Table) appendNext(w []Elem, src source) (res []Elem, n int) {
 		if ce == 0 {
 			r, _ := src.rune()
 			const (
-				hangulSize  = 3
 				firstHangul = 0xAC00
 				lastHangul  = 0xD7A3
 			)
 			if r >= firstHangul && r <= lastHangul {
 				// TODO: performance can be considerably improved here.
 				n = sz
-				var buf [16]byte // Used for decomposing Hangul.
-				for b := src.nfd(buf[:0], hangulSize); len(b) > 0; b = b[sz:] {
-					ce, sz = t.Index.lookup(b)
-					w = append(w, ce)
+				// Algorithmic Hangul decomposition needs no normalization
+				// iterator or escaping temporary input buffer (Unicode 3.12).
+				syllable := r - firstHangul
+				jamo := [3]rune{0x1100 + syllable/(21*28), 0x1161 + (syllable/28)%21, 0x11A7 + syllable%28}
+				count := 2
+				if syllable%28 != 0 {
+					count = 3
+				}
+				var buf [utf8.UTFMax]byte
+				for _, letter := range jamo[:count] {
+					size := utf8.EncodeRune(buf[:], letter)
+					element, _ := t.Index.lookup(buf[:size])
+					w = append(w, element)
 				}
 				return w, n
 			}
@@ -161,11 +170,15 @@ func (t *Table) appendExpansion(w []Elem, ce Elem) []Elem {
 	return w
 }
 
+// Gap buffers are private to one contraction invocation, including recursive
+// calls. No input or table references survive in the pool.
+var contractionScratch = sync.Pool{New: func() any { return new([norm.MaxSegmentSize]byte) }}
+
 func (t *Table) matchContraction(w []Elem, ce Elem, suffix []byte) ([]Elem, int) {
 	index, n, offset := splitContractIndex(ce)
 
 	scan := t.ContractTries.scanner(index, n, suffix)
-	buf := [norm.MaxSegmentSize]byte{}
+	var buf *[norm.MaxSegmentSize]byte
 	bufp := 0
 	p := scan.scan(0)
 
@@ -176,6 +189,8 @@ func (t *Table) matchContraction(w []Elem, ce Elem, suffix []byte) ([]Elem, int)
 		rune := norm.NFD.Properties(suffix[p:])
 		p += rune.Size()
 		if rune.LeadCCC() != 0 {
+			buf = contractionScratch.Get().(*[norm.MaxSegmentSize]byte)
+			defer contractionScratch.Put(buf)
 			prevCC := rune.TrailCCC()
 			// A gap may only occur in the last normalization segment.
 			// This also ensures that len(scan.s) < norm.MaxSegmentSize.
@@ -210,7 +225,11 @@ func (t *Table) matchContraction(w []Elem, ce Elem, suffix []byte) ([]Elem, int)
 		w = t.appendExpansion(w, ce)
 	}
 	// Append weights for the runes in the segment not part of the contraction.
-	for b, p := buf[:bufp], 0; len(b) > 0; b = b[p:] {
+	var remaining []byte
+	if bufp != 0 {
+		remaining = buf[:bufp]
+	}
+	for b, p := remaining, 0; len(b) > 0; b = b[p:] {
 		w, p = t.appendNext(w, source{bytes: b})
 	}
 	return w, n
@@ -223,7 +242,7 @@ func (t *Table) matchContractionString(w []Elem, ce Elem, suffix string) ([]Elem
 	index, n, offset := splitContractIndex(ce)
 
 	scan := t.ContractTries.scannerString(index, n, suffix)
-	buf := [norm.MaxSegmentSize]byte{}
+	var buf *[norm.MaxSegmentSize]byte
 	bufp := 0
 	p := scan.scan(0)
 
@@ -234,6 +253,8 @@ func (t *Table) matchContractionString(w []Elem, ce Elem, suffix string) ([]Elem
 		rune := norm.NFD.PropertiesString(suffix[p:])
 		p += rune.Size()
 		if rune.LeadCCC() != 0 {
+			buf = contractionScratch.Get().(*[norm.MaxSegmentSize]byte)
+			defer contractionScratch.Put(buf)
 			prevCC := rune.TrailCCC()
 			// A gap may only occur in the last normalization segment.
 			// This also ensures that len(scan.s) < norm.MaxSegmentSize.
@@ -268,7 +289,11 @@ func (t *Table) matchContractionString(w []Elem, ce Elem, suffix string) ([]Elem
 		w = t.appendExpansion(w, ce)
 	}
 	// Append weights for the runes in the segment not part of the contraction.
-	for b, p := buf[:bufp], 0; len(b) > 0; b = b[p:] {
+	var remaining []byte
+	if bufp != 0 {
+		remaining = buf[:bufp]
+	}
+	for b, p := remaining, 0; len(b) > 0; b = b[p:] {
 		w, p = t.appendNext(w, source{bytes: b})
 	}
 	return w, n
