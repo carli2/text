@@ -1,4 +1,4 @@
-// Copyright 2012 The Go Authors. All rights reserved.
+// Copyright 2012-2026 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -13,6 +13,7 @@ package collate // import "golang.org/x/text/collate"
 import (
 	"bytes"
 	"strings"
+	"sync"
 
 	"golang.org/x/text/internal/colltab"
 	"golang.org/x/text/language"
@@ -94,18 +95,42 @@ func (b *Buffer) Reset() {
 	b.key = b.key[:0]
 }
 
+// Comparison iterators are exclusively borrowed by one call. Return only
+// scratch storage: never retain the caller's input or the Collator's table.
+var comparisonScratch = sync.Pool{New: func() any { return new([2]iter) }}
+
+func borrowComparison(c *Collator) *[2]iter {
+	scratch := comparisonScratch.Get().(*[2]iter)
+	for i := range scratch {
+		scratch[i].Weighter = c.t
+		if scratch[i].Elems == nil {
+			scratch[i].Elems = scratch[i].wa[:0]
+		}
+	}
+	return scratch
+}
+
+func releaseComparison(scratch *[2]iter) {
+	for i := range scratch {
+		scratch[i].SetInputString("")
+		scratch[i].Weighter = nil
+		scratch[i].pce = 0
+	}
+	comparisonScratch.Put(scratch)
+}
+
 // Compare returns an integer comparing the two byte slices.
 // The result will be 0 if a==b, -1 if a < b, and +1 if a > b.
 // Compare is safe for concurrent use by multiple goroutines.
 func (c *Collator) Compare(a, b []byte) int {
 	// TODO: skip identical prefixes once we have a fast way to detect if a rune is
 	// part of a contraction. This would lead to roughly a 10% speedup for the colcmp regtest.
-	var ia, ib iter
-	ia.init(c)
-	ib.init(c)
+	scratch := borrowComparison(c)
+	defer releaseComparison(scratch)
+	ia, ib := &scratch[0], &scratch[1]
 	ia.SetInput(a)
 	ib.SetInput(b)
-	if res := c.compareIters(&ia, &ib); res != 0 {
+	if res := c.compareIters(ia, ib); res != 0 {
 		return res
 	}
 	if !c.ignore[colltab.Identity] {
@@ -120,12 +145,12 @@ func (c *Collator) Compare(a, b []byte) int {
 func (c *Collator) CompareString(a, b string) int {
 	// TODO: skip identical prefixes once we have a fast way to detect if a rune is
 	// part of a contraction. This would lead to roughly a 10% speedup for the colcmp regtest.
-	var ia, ib iter
-	ia.init(c)
-	ib.init(c)
+	scratch := borrowComparison(c)
+	defer releaseComparison(scratch)
+	ia, ib := &scratch[0], &scratch[1]
 	ia.SetInputString(a)
 	ib.SetInputString(b)
-	if res := c.compareIters(&ia, &ib); res != 0 {
+	if res := c.compareIters(ia, ib); res != 0 {
 		return res
 	}
 	if !c.ignore[colltab.Identity] {
